@@ -70,8 +70,64 @@ contract TokenHandler is Test {
         vm.prank(from);
         token.transfer(to, balance + 1);
     }
+
+    // Force the allowance failure even when random sequences have left the
+    // owner empty. The independent ledger must remain unchanged by the revert.
+    function rejectUnderapproved(uint256 ownerSeed, uint256 spenderSeed, uint256 rawApproval) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 approved = bound(rawApproval, 0, SUPPLY);
+        vm.prank(owner);
+        assertTrue(token.approve(spender, approved));
+        expectedAllowance[owner][spender] = approved;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, approved, approved + 1)
+        );
+        vm.prank(spender);
+        token.transferFrom(owner, spender, approved + 1);
+    }
+
+    // A failed transfer must roll back the allowance spent before the balance
+    // check. Exercise both finite and infinite approval after arbitrary history.
+    function rejectDelegatedOverdraw(uint256 ownerSeed, uint256 spenderSeed, bool infinite) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 balance = expectedBalance[owner];
+        uint256 approved = infinite ? type(uint256).max : balance + 1;
+        vm.prank(owner);
+        assertTrue(token.approve(spender, approved));
+        expectedAllowance[owner][spender] = approved;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, owner, balance, balance + 1)
+        );
+        vm.prank(spender);
+        token.transferFrom(owner, spender, balance + 1);
+    }
+
+    function rejectZeroRecipient(uint256 ownerSeed, uint256 spenderSeed, uint256 rawAmount) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 approved = expectedAllowance[owner][spender];
+        uint256 amount = bound(rawAmount, 0, approved);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        vm.prank(spender);
+        token.transferFrom(owner, address(0), amount);
+    }
+
+    function rejectZeroSpender(uint256 ownerSeed, uint256 amount) external {
+        address owner = actors[ownerSeed % actors.length];
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0)));
+        vm.prank(owner);
+        token.approve(address(0), amount);
+        assertEq(token.allowance(owner, address(0)), 0);
+    }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 64
+/// forge-config: default.invariant.fail-on-revert = true
 contract VerdictIMDInvariantTest is Test {
     uint256 private constant SUPPLY = 1_000_000_000 * 10 ** 18;
     VerdictIMD private token;
@@ -82,11 +138,15 @@ contract VerdictIMDInvariantTest is Test {
         handler = new TokenHandler(token);
         token.transfer(handler.actors(0), SUPPLY);
 
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = TokenHandler.transfer.selector;
         selectors[1] = TokenHandler.approve.selector;
         selectors[2] = TokenHandler.transferFrom.selector;
         selectors[3] = TokenHandler.rejectOverdraw.selector;
+        selectors[4] = TokenHandler.rejectUnderapproved.selector;
+        selectors[5] = TokenHandler.rejectDelegatedOverdraw.selector;
+        selectors[6] = TokenHandler.rejectZeroRecipient.selector;
+        selectors[7] = TokenHandler.rejectZeroSpender.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
